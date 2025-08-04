@@ -66,30 +66,70 @@ def get_imports(tree: ast.Module) -> List[str]:
     return [ast.unparse(stmt) for stmt in tree.body if isinstance(stmt, (ast.Import, ast.ImportFrom))]
 
 
-def analyze_dependencies(tree, class_names, function_names):
-    class_used = {}
-    for stmt in tree.body:
-        if isinstance(stmt, ast.ClassDef):
-            collector = UsedNamesCollector()
-            collector.visit(stmt)
-            uc = [n for n in collector.used_names if n in class_names and n != stmt.name]
-            uf = [n for n in collector.used_names if n in function_names]
-            class_used[stmt.name] = (uc, uf)
-    func_used_classes = set()
-    for stmt in tree.body:
-        if isinstance(stmt, ast.FunctionDef):
-            collector = UsedNamesCollector()
-            collector.visit(stmt)
-            func_used_classes.update([n for n in collector.used_names if n in class_names])
-    top_used = set()
-    for stmt in tree.body:
-        if not isinstance(stmt, (ast.ClassDef, ast.FunctionDef, ast.Import, ast.ImportFrom)):
-            collector = UsedNamesCollector()
-            collector.visit(stmt)
-            top_used.update(collector.used_names)
-    top_used_cls = [n for n in top_used if n in class_names]
-    top_used_fn = [n for n in top_used if n in function_names]
-    return class_used, func_used_classes, top_used_cls, top_used_fn
+class DependencyAnalyzer(ast.NodeVisitor):
+    def __init__(self, tree):
+        self.tree = tree
+        self.dependencies = {}
+        self.import_map = {}
+        self._build_import_map()
+
+    def _build_import_map(self):
+        for node in self.tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.import_map[alias.asname or alias.name] = (None, alias.name, alias.asname)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    self.import_map[alias.asname or alias.name] = (node.module, alias.name, alias.asname)
+
+    def analyze(self):
+        for node in self.tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef)):
+                collector = UsedNamesCollector()
+                collector.visit(node)
+                self.dependencies[node.name] = collector.used_names
+        return self.dependencies
+
+    def get_imports_for_item(self, item_name, all_class_names, all_function_names):
+        used_names = self.dependencies.get(item_name, set())
+        
+        # Separate imports by module to group them (e.g., from typing import List, Optional)
+        from_imports = {}
+        direct_imports = set()
+
+        for name in used_names:
+            if name in self.import_map:
+                module, original_name, asname = self.import_map[name]
+                
+                if module:
+                    # This is a 'from module import ...' statement
+                    if module not in from_imports:
+                        from_imports[module] = set()
+                    
+                    if asname:
+                        from_imports[module].add(f"{original_name} as {asname}")
+                    else:
+                        from_imports[module].add(original_name)
+                else:
+                    # This is an 'import ...' statement
+                    if asname:
+                        direct_imports.add(f"import {original_name} as {asname}")
+                    else:
+                        direct_imports.add(f"import {original_name}")
+
+        # Build the import statements
+        import_statements = list(direct_imports)
+        for module, names in from_imports.items():
+            import_statements.append(f"from {module} import {', '.join(sorted(list(names)))}")
+
+        # Add imports for other classes and functions in the same module
+        for name in used_names:
+            if name in all_class_names and name != item_name:
+                import_statements.append(f"from .{name} import {name}")
+            if name in all_function_names:
+                import_statements.append(f"from .functions import {name}")
+
+        return sorted(list(set(import_statements)))
 
 
 def parse_config(config_path: str) -> Optional[Dict[str, Any]]:
@@ -294,6 +334,12 @@ def validate_split_files(output_dir: str, base_name: str, original_file_path: st
         
         if not functionality_results["classes_match"]:
             validation_results["errors"].extend(functionality_results["errors"])
+            
+        # Test 4: Unused import validation
+        print("🔍 Running unused import validation...")
+        unused_import_results = _validate_unused_imports(split_folder)
+        validation_results["unused_import_tests"] = unused_import_results
+        validation_results["warnings"].extend(unused_import_results["warnings"])
         
         # Determine overall success
         has_critical_errors = len(validation_results["errors"]) > 0
@@ -486,6 +532,37 @@ def _validate_imports(split_folder: str, base_name: str) -> Dict[str, Any]:
         except Exception as e:
             results["all_imports_successful"] = False
             results["errors"].append(f"Error setting up import test environment: {str(e)}")
+    
+    return results
+
+
+def _validate_unused_imports(split_folder: str) -> Dict[str, Any]:
+    """Validate that there are no unused imports in the split files."""
+    results = {
+        "all_imports_used": True,
+        "warnings": []
+    }
+    try:
+        from pyflakes.api import checkPath
+        from pyflakes.reporter import Reporter
+        import io
+
+        for file_name in os.listdir(split_folder):
+            if file_name.endswith('.py'):
+                file_path = os.path.join(split_folder, file_name)
+                string_io = io.StringIO()
+                reporter = Reporter(string_io, string_io)
+                checkPath(file_path, reporter)
+                output = string_io.getvalue()
+                if output:
+                    for line in output.splitlines():
+                        if "imported but unused" in line:
+                            results["all_imports_used"] = False
+                            results["warnings"].append(line)
+    except ImportError:
+        results["warnings"].append("pyflakes not found, skipping unused import validation.")
+    except Exception as e:
+        results["warnings"].append(f"An error occurred during unused import validation: {e}")
     
     return results
 
@@ -748,7 +825,7 @@ def create_interface_file(base_name: str, class_names: List[str], function_names
     return '\n'.join(content_parts) + '\n'
 
 
-def write_split_files(code_path: str, output_dir: str, config_path: Optional[str]=None):
+def write_split_files(code_path: str, output_dir: str, config_path: Optional[str] = None, main_handling: str = 'move'):
     config = None
     if config_path:
         config = parse_config(config_path)
@@ -762,10 +839,31 @@ def write_split_files(code_path: str, output_dir: str, config_path: Optional[str
     imports = get_imports(tree)
     classes, functions = find_top_level_defs(tree)
     occupied = get_occupied_lines(classes + functions)
-    top_level_code = [lines[i - 1] for i in range(1, len(lines) + 1) if i not in occupied]
+    
+    # Find if __name__ == '__main__' block
+    main_block_lines = []
+    main_block_start = -1
+    for i, node in enumerate(tree.body):
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Compare):
+            if (isinstance(node.test.left, ast.Name) and node.test.left.id == '__name__' and
+                    isinstance(node.test.ops[0], ast.Eq) and
+                    isinstance(node.test.comparators[0], ast.Constant) and
+                    node.test.comparators[0].value == '__main__'):
+                main_block_start = node.lineno
+                main_block_end = node.end_lineno
+                main_block_lines = lines[main_block_start - 1:main_block_end]
+                break
+    
+    top_level_code = []
+    for i in range(1, len(lines) + 1):
+        is_in_main_block = main_block_start != -1 and main_block_start <= i <= main_block_end
+        if i not in occupied and not is_in_main_block:
+            top_level_code.append(lines[i-1])
+
     class_names = [n for n, _, _ in classes]
     function_names = [n for n, _, _ in functions]
-    class_used, func_used, top_used_cls, top_used_fn = analyze_dependencies(tree, class_names, function_names)
+    analyzer = DependencyAnalyzer(tree)
+    analyzer.analyze()
     base = os.path.splitext(os.path.basename(code_path))[0]
     
     # Create backup of original file
@@ -778,8 +876,8 @@ def write_split_files(code_path: str, output_dir: str, config_path: Optional[str
     folder = os.path.join(output_dir, base)
     os.makedirs(folder, exist_ok=True)
 
-    # Create a shrunk version of the original file
-    original_file_path = os.path.join(folder, f"{base}.py")
+    # Create a shrunk version of the original file and rename it
+    original_file_path = os.path.join(folder, "_internal_imports.py")
     shrunk_content = create_shrunk_original(code, lines, imports, classes, functions, config, class_names, function_names)
     write_file(original_file_path, shrunk_content)
     format_code(original_file_path)
@@ -787,46 +885,61 @@ def write_split_files(code_path: str, output_dir: str, config_path: Optional[str
     if config:
         # Custom splitting based on config
         for module_name, module_items in config.get("modules", {}).items():
-            module_content = "\n".join(imports) + "\n"
+            module_imports = set()
+            module_content_parts = []
+            
+            # Aggregate dependencies for the entire module
+            for cname in module_items.get("classes", []):
+                if cname in class_names:
+                    module_imports.update(analyzer.get_imports_for_item(cname, class_names, function_names))
+            for fname in module_items.get("functions", []):
+                if fname in function_names:
+                    module_imports.update(analyzer.get_imports_for_item(fname, class_names, function_names))
+            
+            module_content_parts.append("\n".join(sorted(list(module_imports))))
+            module_content_parts.append("\n")
+
             for cname in module_items.get("classes", []):
                 if cname in class_names:
                     # Find class definition
                     for c, start, end in classes:
                         if c == cname and end is not None:
-                            module_content += extract_code(lines, start, end) + "\n\n"
+                            module_content_parts.append(extract_code(lines, start, end) + "\n\n")
                             break
             for fname in module_items.get("functions", []):
                 if fname in function_names:
                     # Find function definition
                     for f, start, end in functions:
                         if f == fname and end is not None:
-                            module_content += extract_code(lines, start, end) + "\n\n"
+                            module_content_parts.append(extract_code(lines, start, end) + "\n\n")
                             break
+            
             module_path = os.path.join(folder, f"{module_name}.py")
-            write_file(module_path, module_content)
+            write_file(module_path, "".join(module_content_parts))
             format_code(module_path)
     else:
         # Default splitting (one class per file)
         for cname, start, end in classes:
             if end is None:
                 continue  # Skip if end line is not available
+            
+            required_imports = analyzer.get_imports_for_item(cname, class_names, function_names)
+            
             lines_code = extract_code(lines, start, end)
             path = os.path.join(folder, f"{cname}.py")
-            content = "\n".join(imports) + "\n"
-            for uc in class_used[cname][0]:
-                content += f"from .{uc} import {uc}\n"
-            if class_used[cname][1]:
-                content += f"from .functions import {', '.join(class_used[cname][1])}\n"
-            content += "\n" + lines_code
+            content = "\n".join(required_imports) + "\n\n" + lines_code
             write_file(path, content)
             format_code(path)
 
         if functions:
             functions_path = os.path.join(folder, "functions.py")
-            content = "\n".join(imports) + "\n"
-            for uc in func_used:
-                content += f"from .{uc} import {uc}\n"
-            content += "\n"
+            
+            # Aggregate imports for all functions
+            function_imports = set()
+            for fname, _, _ in functions:
+                function_imports.update(analyzer.get_imports_for_item(fname, class_names, function_names))
+
+            content = "\n".join(sorted(list(function_imports))) + "\n\n"
             for _, start, end in functions:
                 if end is not None:
                     content += extract_code(lines, start, end) + "\n\n"
@@ -835,15 +948,54 @@ def write_split_files(code_path: str, output_dir: str, config_path: Optional[str
 
     if top_level_code:
         main_path = os.path.join(folder, "main.py")
-        content = "\n".join(imports) + "\n"
-        for uc in top_used_cls:
-            content += f"from .{uc} import {uc}\n"
-        if top_used_fn:
-            content += f"from .functions import {', '.join(top_used_fn)}\n"
-        content += "\n"
+        
+        # Aggregate imports for top-level code
+        top_level_imports = {}
+        collector = UsedNamesCollector()
+        top_level_tree = ast.parse("\n".join(top_level_code))
+        collector.visit(top_level_tree)
+        for name in collector.used_names:
+            if name in analyzer.import_map:
+                module, original_name, asname = analyzer.import_map[name]
+                if module:
+                    if (module, original_name) not in top_level_imports:
+                        top_level_imports[(module, original_name)] = set()
+                    top_level_imports[(module, original_name)].add((original_name, asname))
+                else:
+                    if (original_name, None) not in top_level_imports:
+                        top_level_imports[(original_name, None)] = set()
+                    top_level_imports[(original_name, None)].add((original_name, asname))
+
+        import_statements = []
+        for (module, _), names in top_level_imports.items():
+            if module:
+                name_parts = [f"{n}" + (f" as {an}" if an else "") for n, an in names]
+                import_statements.append(f"from {module} import {', '.join(sorted(name_parts))}")
+            else:
+                for n, an in names:
+                    import_statements.append(f"import {n}" + (f" as {an}" if an else ""))
+        
+        for name in collector.used_names:
+            if name in class_names:
+                import_statements.append(f"from .{name} import {name}")
+            if name in function_names:
+                import_statements.append(f"from .functions import {name}")
+
+        content = "\n".join(sorted(list(set(import_statements)))) + "\n\n"
         content += "\n".join(top_level_code)
         write_file(main_path, content)
         format_code(main_path)
+    
+    if main_block_lines:
+        if main_handling == 'move':
+            main_path = os.path.join(folder, "main.py")
+            content = "\n".join(main_block_lines)
+            write_file(main_path, content)
+            format_code(main_path)
+        elif main_handling == 'keep':
+            with open(original_file_path, 'a', encoding='utf-8') as f:
+                f.write("\n\n" + "\n".join(main_block_lines))
+            format_code(original_file_path)
 
     init_path = os.path.join(folder, "__init__.py")
     init = ""
@@ -901,5 +1053,11 @@ def write_split_files(code_path: str, output_dir: str, config_path: Optional[str
         split_classes = len(functionality_tests.get("split_classes", []))
         missing_classes = len(functionality_tests.get("missing_classes", []))
         print(f"🏗️ Functionality validation: {split_classes}/{original_classes} classes available ({missing_classes} missing)")
-    
+
+    unused_import_tests = validation_results.get("unused_import_tests", {})
+    if not unused_import_tests.get("all_imports_used"):
+        print(f"⚠️ Unused import validation: {len(unused_import_tests.get('warnings', []))} warnings found")
+    else:
+        print("✅ Unused import validation: All imports are used")
+
     return validation_results["success"]
