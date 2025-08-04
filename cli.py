@@ -9,6 +9,7 @@ def main():
     parser.add_argument("-o", "--output", default="output", help="Directory to hold split files")
     parser.add_argument("--doc", action="store_true", help="Include documentation generation")
     parser.add_argument("--config", help="Path to a configuration file")
+    parser.add_argument("--main-handling", choices=['move', 'keep', 'discard'], default='move', help="How to handle the if __name__ == '__main__' block")
 
     args = parser.parse_args()
     input_path = args.input.strip('"')
@@ -16,7 +17,7 @@ def main():
         print(f"Input not found: {input_path}")
         return
     os.makedirs(args.output, exist_ok=True)
-    validation_success = write_split_files(input_path, args.output, args.config)
+    validation_success = write_split_files(input_path, args.output, args.config, args.main_handling)
     
     if validation_success:
         print(f"\n✅ Splitting complete and validated! Files in {args.output}")
